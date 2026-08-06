@@ -14,6 +14,14 @@ from torch.fx.experimental.symbolic_shapes import optimization_hint
 from torch.fx.operator_schemas import normalize_function
 
 from . import ir
+from .comm_analysis_rccl import (
+    RCCL_DEFAULT_TUNING_MODEL,
+    RCCL_FACTOR_TABLE_SIZE,
+    RCCL_LL128_ARCHS,
+    RCCL_TREE_SIMPLE_DISABLED_ARCHS,
+    RCCL_TUNING_MODELS,
+    RCCL_XGMI_BW,
+)
 from .utils import get_dtype_size, snode_args_kwargs, sympy_product
 from .virtualized import V
 
@@ -45,6 +53,9 @@ class InterconnectType(IntEnum):
     IB_HDR = 4  # 200 Gbps InfiniBand
     IB_NDR = 5  # 400 Gbps InfiniBand / RoCE
     PCIE = 6  # PCIe (no NVLink)
+    XGMI_MI200 = 7
+    XGMI_MI300 = 8
+    XGMI_MI350 = 9
 
 
 @dataclass(frozen=True)
@@ -78,6 +89,10 @@ INTERCONNECT_PROFILES: dict[InterconnectType, InterconnectProfile] = {
     ),
     # PCIe: ~10 GB/s effective NCCL bus BW (GPU->CPU->GPU ring steps)
     InterconnectType.PCIE: InterconnectProfile(10.0, 60.0, 15.0),
+    # XGMI: provisional, not calibrated against hardware.
+    InterconnectType.XGMI_MI200: InterconnectProfile(22.0, 50.0, 10.0),
+    InterconnectType.XGMI_MI300: InterconnectProfile(40.0, 40.0, 10.0),
+    InterconnectType.XGMI_MI350: InterconnectProfile(55.0, 35.0, 10.0),
 }
 
 _GPU_TO_INTRA: dict[NVIDIA_GPU_TYPE, InterconnectType] = {
@@ -93,6 +108,17 @@ _GPU_TO_INTER: dict[NVIDIA_GPU_TYPE, InterconnectType] = {
     NVIDIA_GPU_TYPE.BLACKWELL: InterconnectType.IB_NDR,
 }
 
+_AMD_GPU_TO_INTRA: dict[str, InterconnectType] = {
+    "gfx90a": InterconnectType.XGMI_MI200,
+    "gfx942": InterconnectType.XGMI_MI300,
+    "gfx950": InterconnectType.XGMI_MI350,
+}
+_XGMI_INTERCONNECTS = (
+    InterconnectType.XGMI_MI200,
+    InterconnectType.XGMI_MI300,
+    InterconnectType.XGMI_MI350,
+)
+
 
 @functools.lru_cache
 def _has_nvlink() -> bool:
@@ -101,20 +127,21 @@ def _has_nvlink() -> bool:
 
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         return True  # Single GPU: interconnect irrelevant
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "topo", "-m"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if result.returncode == 0:
-            # Check GPU-GPU section (before Legend) for "NV" links
-            topo = result.stdout.split("Legend")[0]
-            return "NV" in topo
-    except (subprocess.TimeoutExpired, OSError):
-        pass
-    # Fallback: peer access generally implies NVLink on datacenter GPUs
+    if torch.version.hip is None:
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "topo", "-m"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if result.returncode == 0:
+                # Check GPU-GPU section (before Legend) for "NV" links
+                topo = result.stdout.split("Legend")[0]
+                return "NV" in topo
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    # Fallback: peer access generally implies NVLink (or XGMI) on datacenter GPUs
     try:
         return torch.cuda.can_device_access_peer(0, 1)
     except (AssertionError, RuntimeError):
@@ -148,15 +175,29 @@ def get_gpu_type() -> NVIDIA_GPU_TYPE:
         return NVIDIA_GPU_TYPE.AMPERE
 
 
+@functools.lru_cache
+def get_rocm_arch() -> str:
+    """Return the base gfx arch (e.g. "gfx942"), or "" if not on ROCm."""
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return ""
+    if torch.cuda.device_count() == 0:
+        return ""
+    # Strips the ":sramecc+:xnack-" feature suffix.
+    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+
+
 def detect_interconnect(group_size: int) -> InterconnectType:
     """Auto-detect interconnect type from GPU generation and group topology."""
     gpus_per_node = torch.cuda.device_count() if torch.cuda.is_available() else 8
-    gpu_gen = get_gpu_type()
-    if math.ceil(group_size / gpus_per_node) == 1:
-        if not _has_nvlink():
-            return InterconnectType.PCIE
-        return _GPU_TO_INTRA.get(gpu_gen, InterconnectType.NVLINK_A100)
-    return _GPU_TO_INTER.get(gpu_gen, InterconnectType.IB_HDR)
+    if math.ceil(group_size / gpus_per_node) > 1:
+        if torch.version.hip is not None:
+            return InterconnectType.IB_NDR
+        return _GPU_TO_INTER.get(get_gpu_type(), InterconnectType.IB_HDR)
+    if not _has_nvlink():
+        return InterconnectType.PCIE
+    if torch.version.hip is not None:
+        return _AMD_GPU_TO_INTRA.get(get_rocm_arch(), InterconnectType.XGMI_MI200)
+    return _GPU_TO_INTRA.get(get_gpu_type(), InterconnectType.NVLINK_A100)
 
 
 def get_collective_type_from_kernel_name(kernel_name: str) -> NCCL_COLL:
@@ -250,6 +291,11 @@ baseLat = [
     # Ring
     [6.6, 14.0, 8.4],
 ]
+
+# RCCL base latencies in us, indexed by [proto]. File-static in RCCL and identical for Tree
+# and Ring, so unlike hwLat/bwRatio it is not part of the per-arch tuning model.
+# https://github.com/ROCm/rccl/blob/develop/src/graph/tuning.cc (baseLat, :137-140)
+_RCCL_BASE_LAT = [12.0, 12.0, 17.0]
 
 # Hardware latencies in us — [hw][algo][proto]
 # https://github.com/NVIDIA/nccl/blob/master/src/graph/tuning.cc (ncclTunerConstantsDefaults)
@@ -425,6 +471,9 @@ _GPU_INTER_NODE_BW: dict[NVIDIA_GPU_TYPE, float] = {
     NVIDIA_GPU_TYPE.BLACKWELL: 50.0,
 }
 
+# Per-GPU inter-node bandwidth (GB/s) on ROCm: one 400 Gbps NIC per GPU.
+_AMD_INTER_NODE_BW = 50.0
+
 
 def get_intra_node_bw() -> float:
     """Return intra-node bandwidth in GB/s. Config overrides auto-detection."""
@@ -433,6 +482,8 @@ def get_intra_node_bw() -> float:
         return float(override)
     if not _has_nvlink():
         return _PCIE_INTRA_NODE_BW
+    if torch.version.hip is not None:
+        return RCCL_XGMI_BW.get(get_rocm_arch(), 144.0)
     return _GPU_NVLINK_BW.get(get_gpu_type(), 240.0)
 
 
@@ -441,6 +492,8 @@ def get_inter_node_bw() -> float:
     override = torch._inductor.config.inter_node_bw
     if override is not None:
         return float(override)
+    if torch.version.hip is not None:
+        return _AMD_INTER_NODE_BW
     return _GPU_INTER_NODE_BW.get(get_gpu_type(), 25.0)
 
 
@@ -640,6 +693,117 @@ def _nccl_algo_time(
     return time_us
 
 
+def _rccl_algo_time(
+    nBytes: int,
+    group_size: int,
+    coll: NCCL_COLL,
+    algo: int,
+    proto: int,
+) -> float:
+    """Compute RCCL estimated time in us for a given (algo, proto) pair.
+
+    ROCm counterpart of _nccl_algo_time. Mirrors the
+    ``defined(__HIP_PLATFORM_AMD__)`` branches of ncclTopoTuneModel and
+    ncclTopoGetAlgoTime in https://github.com/ROCm/rccl/blob/develop/src/graph/tuning.cc.
+    Returns -1 if the (algo, proto) combination is disabled for this configuration.
+    """
+    gpus_per_node = torch.cuda.device_count() if torch.cuda.is_available() else 8
+    nNodes = math.ceil(group_size / gpus_per_node)
+    nRanks = group_size
+    arch = get_rocm_arch()
+    model = RCCL_TUNING_MODELS.get(arch, RCCL_DEFAULT_TUNING_MODEL)
+    interconnect = detect_interconnect(group_size)
+    is_xgmi = interconnect in _XGMI_INTERCONNECTS
+
+    # tuning.cc:781
+    if (
+        algo == NCCL_ALGO.TREE
+        and proto == NCCL_PROTO.SIMPLE
+        and nNodes == 1
+        and arch in RCCL_TREE_SIMPLE_DISABLED_ARCHS
+    ):
+        return -1.0
+
+    # tuning.cc:990-1012. RCCL gates LL128 on topo->ll128Enabled, which is set
+    # only for recognized platforms; arch plus an XGMI intra-node path is the
+    # closest Python-visible proxy.
+    if proto == NCCL_PROTO.LL128 and (arch not in RCCL_LL128_ARCHS or not is_xgmi):
+        return -1.0
+
+    # Deviation from tuning.cc:786 (bwIntra for nNodes <= 2), mirroring the
+    # documented NVIDIA-path deviation above: once the collective leaves the
+    # node the network is the bottleneck.
+    busBw = get_intra_node_bw() if nNodes == 1 else get_inter_node_bw()
+
+    # tuning.cc:809-812. bwRatio is the entirety of the AMD-path refinement;
+    # there are no per-channel BW caps, so nChannels only scales busBw and is
+    # folded into the bandwidth constants.
+    busBw *= model.bwRatio[0 if nNodes <= 2 else 1][algo][proto]
+
+    if busBw <= 0:
+        return -1.0
+
+    if coll == NCCL_COLL.ALL_REDUCE:
+        nsteps = 2 * (nRanks - 1)
+    elif coll in (NCCL_COLL.REDUCE_SCATTER, NCCL_COLL.ALL_GATHER):
+        nsteps = nRanks - 1
+    elif coll == NCCL_COLL.ALL_TO_ALL:
+        nsteps = 2 * (nRanks - 1)
+    elif coll == NCCL_COLL.P2P:
+        nsteps = 1
+    else:
+        return -1.0
+
+    if algo == NCCL_ALGO.TREE and coll == NCCL_COLL.ALL_REDUCE:
+        bandwidth = busBw * 0.5
+    elif algo == NCCL_ALGO.RING:
+        bandwidth = busBw * (1.0 * nRanks / nsteps)
+    else:
+        bandwidth = busBw * 0.5
+
+    if bandwidth <= 0:
+        return -1.0
+
+    ppn = nRanks / nNodes
+    intraHw = NCCL_HW.NVLINK if is_xgmi else NCCL_HW.PCI
+    lat = _RCCL_BASE_LAT[proto]
+    intraLat = model.hwLat[intraHw][algo][proto]
+    # tuning.cc:866: with one rank per node the inter-node hop always uses the
+    # Tree row. The NVIDIA path has no such case.
+    interLat = model.hwLat[NCCL_HW.NET][NCCL_ALGO.TREE if ppn == 1 else algo][proto]
+
+    # tuning.cc:677-682 returns 2.0 us on AMD-CPU hosts (1.0 on Intel).
+    netOverhead = 2.0 if nNodes > 1 else 0.0
+    if proto == NCCL_PROTO.SIMPLE and nNodes > 1:
+        netOverhead *= 3.0
+    intraLat = max(intraLat, netOverhead)
+
+    if algo == NCCL_ALGO.RING:
+        nInterSteps = (
+            0
+            if nNodes == 1
+            else (2 * (nNodes - 1) if coll == NCCL_COLL.ALL_REDUCE else nNodes - 1)
+        )
+        lat += (nsteps - nInterSteps) * intraLat + nInterSteps * interLat
+    elif algo == NCCL_ALGO.TREE:
+        if coll == NCCL_COLL.ALL_REDUCE:
+            lat += 2 * (
+                (nRanks // max(nNodes, 1) - 1) * intraLat + _log2i(nNodes) * interLat
+            )
+
+    # tuning.cc:1128-1136. Unlike the NVIDIA path, logSize is clamped rather
+    # than range-checked, Tree is corrected for every collective, and Ring is
+    # corrected whenever the collective spans nodes.
+    logSize = min(max(_log2i(nBytes >> 6), 0), RCCL_FACTOR_TABLE_SIZE - 1)
+    if algo == NCCL_ALGO.TREE:
+        bandwidth *= model.treeCorrectionFactor[proto][logSize]
+    elif algo == NCCL_ALGO.RING and nNodes > 1:
+        bandwidth *= model.ringCorrectionFactor[proto][logSize]
+
+    time_us = lat + nBytes / (1000.0 * bandwidth)
+    return time_us
+
+
 def _nccl_best_algo_time(
     nBytes: int,
     group_size: int,
@@ -653,13 +817,14 @@ def _nccl_best_algo_time(
     best_time = float("inf")
     best_algo = NCCL_ALGO.RING
     best_proto = NCCL_PROTO.LL
+    algo_time = _rccl_algo_time if torch.version.hip is not None else _nccl_algo_time
 
     for algo in (NCCL_ALGO.TREE, NCCL_ALGO.RING):
         # Tree only supports allreduce in our model
         if algo == NCCL_ALGO.TREE and coll != NCCL_COLL.ALL_REDUCE:
             continue
         for proto in (NCCL_PROTO.LL, NCCL_PROTO.LL128, NCCL_PROTO.SIMPLE):
-            t = _nccl_algo_time(nBytes, group_size, coll, algo, proto)
+            t = algo_time(nBytes, group_size, coll, algo, proto)
             if 0 <= t < best_time:
                 best_time = t
                 best_algo = algo
@@ -674,9 +839,10 @@ def estimate_nccl_collective_runtime_impl(
     """Returns estimated NCCL collective runtime in milliseconds (ms).
 
     Uses a multi-algorithm, multi-protocol model aligned with NCCL's
-    ncclTopoTuneModel and ncclTopoGetAlgoTime (tuning.cc). Evaluates
-    Ring and Tree algorithms across LL, LL128, and SIMPLE protocols,
-    selecting the (algo, proto) pair that minimizes estimated time.
+    ncclTopoTuneModel and ncclTopoGetAlgoTime (tuning.cc), or RCCL's
+    equivalents on ROCm. Evaluates Ring and Tree algorithms across LL,
+    LL128, and SIMPLE protocols, selecting the (algo, proto) pair that
+    minimizes estimated time.
     """
     if group_size <= 1:
         return 0
