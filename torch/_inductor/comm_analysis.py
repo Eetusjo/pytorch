@@ -693,6 +693,22 @@ def _nccl_algo_time(
     return time_us
 
 
+def _rccl_nbytes(nBytes: int, group_size: int, coll: NCCL_COLL) -> int:
+    """Convert an inputs-plus-outputs byte count to RCCL's nBytes convention.
+
+    The bus-to-algorithm bandwidth conversion below (busBw * nRanks / nsteps)
+    is only valid if nBytes is the full unsharded buffer, that is
+    max(input, output): the input for AllReduce and ReduceScatter, the output
+    for AllGather. estimate_fx_collective_size sums inputs and outputs, which
+    overstates nBytes by 2x for AllReduce and by (nRanks + 1) / nRanks for
+    AllGather and ReduceScatter. For AllReduce that is exactly one bucket of
+    the correction-factor tables, whose adjacent entries differ by up to 10x.
+    """
+    if coll in (NCCL_COLL.ALL_GATHER, NCCL_COLL.REDUCE_SCATTER):
+        return nBytes * group_size // (group_size + 1)
+    return nBytes // 2
+
+
 def _rccl_algo_time(
     nBytes: int,
     group_size: int,
@@ -1083,6 +1099,10 @@ def estimate_nccl_collective_runtime_from_fx_node(
         if est_time_ms is not None:
             return est_time_ms
 
+    if torch.version.hip is not None:
+        tensor_storage_size_bytes = _rccl_nbytes(
+            tensor_storage_size_bytes, group_size, coll
+        )
     return estimate_nccl_collective_runtime_impl(
         tensor_storage_size_bytes, group_size, coll
     )
