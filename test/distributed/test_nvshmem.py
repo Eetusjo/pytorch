@@ -6,6 +6,7 @@
 
 import os
 import unittest
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -147,6 +148,22 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
                 pieces.append(view.clone())
             compute.wait_stream(comm)
             self.assertEqual(torch.cat(pieces, dim=1), torch.stack([tile + r for r in range(self.world_size)]))
+
+    @unittest.skipUnless(TEST_WITH_ROCM, "requires rocSHMEM")
+    def test_fused_gather_natural_rows(self) -> None:
+        self._init_device()
+        group = dist.group.WORLD.group_name
+        x = torch.randn(4, 1024, 64, device=self.device)[..., ::2]
+        bs = [torch.randn(32, n, device=self.device) for n in (16, 8)]
+        for keep in (True, False):
+            ref, ys = symm_mem._fused_all_gather_matmul_fallback(x, bs, 1, group, return_A=keep)
+            with patch.dict(os.environ, TORCH_SYMM_MEM_ROCSHMEM_ASYNC_TP="1"):
+                actual, zs = torch.ops.symm_mem.fused_all_gather_matmul(x, bs, 1, group, return_A=keep)
+            self.assertEqual(ref, actual)
+            if keep:
+                self.assertEqual(ref.stride(), actual.stride())
+            self.assertEqual(ys, zs)
+            self.assertEqual([y.stride() for y in ys], [z.stride() for z in zs])
 
     def test_mempool_tensor_factory(self) -> None:
         """

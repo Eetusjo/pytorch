@@ -980,6 +980,19 @@ def _fused_all_gather_matmul(
             A_shard, Bs, gather_dim, group_name, return_A=return_A
         )
 
+    if torch.version.hip is not None:
+        from . import _rocshmem_async
+
+        if _rocshmem_async.requested(A_shard):
+            pieces = _rocshmem_async.pieces_for(A_shard, gather_dim, group_name)
+            if pieces:
+                return _rocshmem_async.gather_mm(
+                    A_shard, Bs, gather_dim, group_name, pieces, return_A
+                )
+            return _fused_all_gather_matmul_fallback(
+                A_shard, Bs, gather_dim, group_name, return_A=return_A
+            )
+
     if _should_use_fused_all_gather_matmul_native(A_shard, Bs, gather_dim, group_name):
         group = c10d._resolve_process_group(group_name)
         leading_dims = list(A_shard.shape[:-1])

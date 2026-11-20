@@ -50,6 +50,14 @@ infer support from an operator being present in `torch.ops.symm_mem`: some
 kernels are compiled only for particular backends or require runtime hardware
 features.
 
+On single-node ROCm jobs using the `NVSHMEM` allocator, an experimental
+unscaled fused all-gather/matmul path can be enabled by setting
+`TORCH_SYMM_MEM_ROCSHMEM_ASYNC_TP=1` on **all ranks**. The initial scope is
+the default world group, eager execution, and evenly divisible non-feature
+dimensions. It does not change the rank order, strides, or ownership of the
+returned tensors. This opt-in assumes IPC connectivity across the whole
+group and does not guarantee that the rocSHMEM runtime selects SDMA.
+
 The `torch.ops.symm_mem` namespace also does not provide a stable public
 autograd contract. For training graphs, prefer expressing the unfused
 collective and computation with higher-level PyTorch APIs and allowing the
