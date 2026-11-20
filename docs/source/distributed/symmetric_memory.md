@@ -38,7 +38,7 @@ project-wide PyTorch stability levels or backward-compatibility guarantees:
 | `multimem_one_shot_all_reduce`, `multimem_one_shot_all_reduce_out`, and `multimem_one_shot_reduce_out` | Experimental | Hardware-specific | Compiler-oriented multimem variants. Their reduction order is not fixed, so all ranks are not guaranteed to receive bitwise-identical results. |
 | `get_remote_tensors` | Alpha | Hardware-specific | Create local tensor views of peer allocations when every peer is directly addressable. The views require explicit cross-rank synchronization. |
 | `nvshmem_*`, `all_to_all_vdev*`, `tile_reduce`, and `multi_root_tile_reduce` | Alpha | Backend-specific | NVSHMEM or rocSHMEM transport and device-driven collectives. Availability differs by operation and SHMEM implementation. |
-| `reduce_scatter_offset` and `all_to_all_nd` | Alpha | Backend-specific | NCCL-backend routing and multidimensional all-to-all. |
+| `reduce_scatter_offset` and `all_to_all_nd` | Alpha | Backend-specific | NCCL-backend routing and multidimensional all-to-all. The latter also supports single-node rocSHMEM IPC: input is symmetric, output may be ordinary local memory. |
 | `put_signal` and `wait_signal` | Experimental | Backend-specific | One-sided signaling; currently implemented only for the NCCL backend. |
 | `_low_contention_*`, `_async_input_mm`, `_rendezvous`, and `_barrier` | Internal | Compiler-facing | Compiler and dispatcher implementation details. |
 | `one_shot_all_reduce_copy`, `one_shot_all_reduce_copy_out`, `two_shot_all_reduce_out`, and `reduce_scatter_out` | Internal | Compiler-facing | Compiler buffer-planning variants. Use the documented allocating or in-place operator instead. |

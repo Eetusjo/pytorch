@@ -2821,6 +2821,10 @@ def all_to_all_nd(
         torch.ops.symm_mem.nccl_all_to_all_nd(
             input, out, scatter_dim, gather_dim, group
         )
+    elif backend == "NVSHMEM" and torch.version.hip is not None:
+        torch.ops.symm_mem.rocshmem_all_to_all_nd(
+            input, out, scatter_dim, gather_dim, group
+        )
     else:
         raise NotImplementedError(f"all_to_all_nd: unsupported backend: {backend}")
 

@@ -125,6 +125,28 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         hdl.barrier()
 
     @unittest.skipUnless(TEST_WITH_ROCM, "requires rocSHMEM")
+    def test_nd_all_to_all_into_ordinary_output(self) -> None:
+        self._init_device()
+        group = dist.group.WORLD.group_name
+        p = self.world_size
+        rows, cols = 3, 32
+        # A nonzero view offset and a padded row stride must reach the RMA source.
+        storage = symm_mem.empty(p * rows * (cols + 1) + 1, dtype=torch.int32, device=self.device)
+        symm_mem.rendezvous(storage, group)
+        tile = torch.arange(rows * cols, device=self.device, dtype=torch.int32).reshape(rows, cols)
+        for scatter in (0, 1):
+            shape = (p * rows, cols) if scatter == 0 else (rows, p * cols)
+            src = storage.as_strided(shape, (shape[1] + 1, 1), storage_offset=1)
+            pieces = [tile + 1000 * self.rank + j for j in range(p)]
+            src.copy_(torch.cat(pieces, dim=scatter))
+            expected = torch.stack(
+                [tile + 1000 * j + self.rank for j in range(p)], dim=1 - scatter
+            )
+            out = torch.empty_like(expected)
+            symm_mem.all_to_all_nd(src, out, scatter, 1 - scatter, group=group)
+            self.assertEqual(out, expected)
+
+    @unittest.skipUnless(TEST_WITH_ROCM, "requires rocSHMEM")
     def test_progressive_gather_rank_order(self) -> None:
         self._init_device()
         group = dist.group.WORLD.group_name

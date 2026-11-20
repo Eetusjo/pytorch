@@ -27,6 +27,7 @@
 #include <c10/hip/HIPGuard.h>
 
 #include <torch/csrc/distributed/c10d/symm_mem/env.hpp>
+#include <torch/csrc/distributed/c10d/symm_mem/GroupStreamGuard.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nvshmem_extension.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/nvshmem_team_manager.hpp>
 #include <torch/csrc/distributed/c10d/symm_mem/CUDASymmetricMemory-inl.cuh>
@@ -49,6 +50,62 @@ namespace c10d::nvshmem_extension {
 #define WARP_SIZE C10_WARP_SIZE
 
 namespace {
+// Read the destination rank's slice of each symmetric source. Unlike the
+// push path, the caller's local output need not be a symmetric allocation.
+__global__ void pull_nd(
+    const char* src, char* dst, const int* global_pes, int rank, int peers,
+    int64_t rows, size_t width, size_t peer_stride, size_t row_stride,
+    bool scatter_rows) {
+  for (int j = threadIdx.x; j < peers; j += blockDim.x) {
+    const int pe = global_pes[j];
+    for (int64_t r = 0; r < rows; ++r) {
+      const auto slot = scatter_rows ? r * peers + j : j * rows + r;
+      rocshmem_getmem_nbi(dst + slot * width, src + rank * peer_stride + r * row_stride, width, pe);
+    }
+    rocshmem_pe_quiet(&pe, 1);
+  }
+}
+
+void rocshmem_all_to_all_nd(
+    const at::Tensor& src, at::Tensor& dst, int64_t scatter, int64_t gather,
+    const std::string& group_name) {
+  TORCH_CHECK(src.is_cuda() && dst.device() == src.device());
+  c10::cuda::CUDAGuard device_guard(src.device());
+  TORCH_CHECK(c10d::symmetric_memory::get_backend(src.device()) == "NVSHMEM");
+  TORCH_CHECK((scatter == 0 && gather == 1) || (scatter == 1 && gather == 0));
+  TORCH_CHECK(src.dim() == 2 || src.dim() == 3);
+  TORCH_CHECK(src.stride(-1) == 1 && dst.is_contiguous());
+  TORCH_CHECK(src.scalar_type() == dst.scalar_type() && !src.is_alias_of(dst));
+  auto hdl = c10d::symmetric_memory::rendezvous(src, group_name);
+  TORCH_CHECK(hdl && hdl->world_within_direct_access(), "expected symmetric IPC input");
+  const int p = hdl->get_world_size();
+  const bool scatter_rows = scatter == 0;
+  auto tiles = src;
+  if (src.dim() == 2) {
+    TORCH_CHECK(src.size(scatter) % p == 0);
+    tiles = src.unflatten(scatter, {p, src.size(scatter) / p});
+  }
+  TORCH_CHECK(tiles.size(scatter) == p);
+  const int64_t rows = tiles.size(1 - scatter);
+  const int64_t cols = tiles.size(2);
+  const auto out_rows = scatter_rows ? rows : p * rows;
+  TORCH_CHECK((dst.dim() == 3 && dst.size(gather) == p &&
+               dst.size(1 - gather) == rows && dst.size(2) == cols) ||
+              (dst.dim() == 2 && dst.size(0) == out_rows &&
+               dst.size(1) == (scatter_rows ? p * cols : cols)));
+  if (src.numel() == 0) {
+    return;
+  }
+  const auto es = src.element_size();
+  c10d::symmetric_memory::GroupStreamGuard order(group_name);
+  hdl->barrier(0, 0);
+  hipLaunchKernelGGL(pull_nd, dim3(1), dim3(64), 0, at::cuda::getCurrentCUDAStream(),
+                     static_cast<const char*>(src.const_data_ptr()), static_cast<char*>(dst.mutable_data_ptr()),
+                     hdl->get_rank_to_global_rank_dev(), hdl->get_rank(), p, rows, cols * es,
+                     tiles.stride(scatter) * es, tiles.stride(1 - scatter) * es, scatter_rows);
+  C10_HIP_CHECK(hipGetLastError());
+  hdl->barrier(0, 0); // all remote reads completed before the inputs can be reused
+}
 
 bool parse_rocshmem_version_ge(
     const char* version,
@@ -956,6 +1013,7 @@ void release_nvshmem_team_pool(const std::string& group_name) {
 } // namespace c10d::nvshmem_extension
 
 TORCH_LIBRARY_IMPL(symm_mem, CUDA, m) {
+  m.impl("rocshmem_all_to_all_nd", c10d::nvshmem_extension::rocshmem_all_to_all_nd);
   m.impl("_rocshmem_gather_slices", c10d::nvshmem_extension::rocshmem_gather_slices);
   m.impl("nvshmem_broadcast", c10d::nvshmem_extension::nvshmem_broadcast);
   m.impl("nvshmem_put", c10d::nvshmem_extension::nvshmem_put);
