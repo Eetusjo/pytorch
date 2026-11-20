@@ -51,7 +51,7 @@ kernels are compiled only for particular backends or require runtime hardware
 features.
 
 On single-node ROCm jobs using the `NVSHMEM` allocator, an experimental
-unscaled fused all-gather/matmul path can be enabled by setting
+unscaled fused all-gather/matmul or matmul/reduce-scatter path can be enabled by setting
 `TORCH_SYMM_MEM_ROCSHMEM_ASYNC_TP=1` on **all ranks**. The initial scope is
 the default world group, eager execution, and evenly divisible non-feature
 dimensions. It does not change the rank order, strides, or ownership of the

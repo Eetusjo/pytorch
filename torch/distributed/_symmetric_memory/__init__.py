@@ -1434,6 +1434,19 @@ def _fused_matmul_reduce_scatter(
             A, B, reduce_op, scatter_dim, group_name
         )
 
+    if torch.version.hip is not None:
+        from . import _rocshmem_async
+
+        if _rocshmem_async.requested(A):
+            if reduce_op not in ("sum", "avg"):
+                raise ValueError("reduce_op must be sum or avg")
+            pieces = _rocshmem_async.pieces_for(A, scatter_dim, group_name, scatter=True)
+            if pieces:
+                return _rocshmem_async.mm_scatter(
+                    A, B, scatter_dim, reduce_op, group_name, pieces
+                )
+            return _fused_matmul_reduce_scatter_fallback(A, B, reduce_op, scatter_dim, group_name)
+
     with torch.profiler.record_function("fused_matmul_reduce_scatter"):
         return _fused_matmul_reduce_scatter_impl(
             mm_out_op=torch.ops.aten.mm.out,

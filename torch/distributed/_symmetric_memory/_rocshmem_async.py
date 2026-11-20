@@ -18,7 +18,9 @@ def requested(x: torch.Tensor) -> bool:
     )
 
 
-def pieces_for(x: torch.Tensor, dim: int, group_name: c10d.GroupName) -> int:
+def pieces_for(
+    x: torch.Tensor, dim: int, group_name: c10d.GroupName, *, scatter: bool = False
+) -> int:
     group = c10d._resolve_process_group(group_name)
     if (
         group is not c10d.group.WORLD
@@ -32,6 +34,10 @@ def pieces_for(x: torch.Tensor, dim: int, group_name: c10d.GroupName) -> int:
     # Keep tail handling and the existing small-M native path out of this
     # experimental selector. Only collective-uniform shape metadata is used.
     rows = math.prod(x.shape[:-1])
+    if scatter:
+        if x.size(dim) % group.size():
+            return 0
+        rows //= group.size()
     return 4 if rows * group.size() > 4096 and rows % 4 == 0 else 0
 
 
@@ -73,3 +79,59 @@ def gather_mm(
         a = restore(gathered.clone()) if return_a else None
         comm.wait_stream(compute)
         return a, [restore(dest) for dest in dests]
+
+
+def mm_scatter(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    dim: int,
+    reduction: str,
+    group_name: c10d.GroupName,
+    pieces: int,
+) -> torch.Tensor:
+    x = a.movedim(dim, 0).contiguous()
+    p = c10d._get_group_size_by_name(group_name)
+    tiles = x.view(p, -1, x.size(-1))
+    rows, n = tiles.size(1), b.size(1)
+    m = rows // pieces
+    with torch.cuda.device(x.device):
+        compute = torch.cuda.current_stream()
+        comm = sm._get_backend_stream()
+        # One send and receive region per piece. The next GEMM may start
+        # before this piece has been sent; it must not overwrite its source.
+        elements = p * m * n
+        hdl = sm.get_symm_mem_workspace(
+            group_name, 2 * pieces * elements * x.element_size()
+        )
+        result = a.new_empty(rows, n)
+        received = []
+        done = []
+        for i in range(pieces):
+            send = hdl.get_buffer(hdl.rank, (p, m, n), a.dtype, 2 * i * elements)
+            recv = hdl.get_buffer(hdl.rank, (p, m, n), a.dtype, (2 * i + 1) * elements)
+            torch.bmm(tiles[:, i * m : (i + 1) * m], b.expand(p, -1, -1), out=send)
+            comm.wait_stream(compute)
+            with torch.cuda.stream(comm):
+                # All ranks have retired prior inbox consumers before writing.
+                hdl.barrier()
+                torch.ops.symm_mem.nvshmem_all_to_all(send, recv, group_name)
+                hdl.barrier()
+                done.append(comm.record_event())
+            received.append(recv)
+            if i:
+                compute.wait_event(done[i - 1])
+                result[(i - 1) * m : i * m].copy_(
+                    sm.reduce_partials(
+                        received[i - 1], dim=0, reduce_op=reduction,
+                        output_dtype=a.dtype, group_size=p,
+                    )
+                )
+        compute.wait_event(done[-1])
+        result[-m:].copy_(
+            sm.reduce_partials(
+                received[-1], dim=0, reduce_op=reduction,
+                output_dtype=a.dtype, group_size=p,
+            )
+        )
+        comm.wait_stream(compute)
+        return result.view(x.size(0) // p, *x.shape[1:-1], n).movedim(0, dim).contiguous()

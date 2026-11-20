@@ -165,6 +165,21 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
             self.assertEqual(ys, zs)
             self.assertEqual([y.stride() for y in ys], [z.stride() for z in zs])
 
+    @unittest.skipUnless(TEST_WITH_ROCM, "requires rocSHMEM")
+    def test_fused_reduce_scatter_natural_rows(self) -> None:
+        self._init_device()
+        group = dist.group.WORLD.group_name
+        # A rank-specific partial makes a wrong destination or missing sender visible.
+        a = torch.arange(16 * 1024, device=self.device).reshape(4, 1024, 4)
+        a = (a % 17 + self.rank).float().repeat(1, 2, 1)
+        b = torch.eye(4, device=self.device)
+        for reduction in ("sum", "avg"):
+            ref = symm_mem._fused_matmul_reduce_scatter_fallback(a, b, reduction, 1, group)
+            with patch.dict(os.environ, TORCH_SYMM_MEM_ROCSHMEM_ASYNC_TP="1"):
+                actual = torch.ops.symm_mem.fused_matmul_reduce_scatter(a, b, reduction, 1, group)
+            self.assertEqual(actual, ref)
+            self.assertEqual(actual.stride(), ref.stride())
+
     def test_mempool_tensor_factory(self) -> None:
         """
         Test the effectiveness of MemPool on tensor factory ops.
