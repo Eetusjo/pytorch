@@ -122,6 +122,10 @@ def get_symm_mem_workspace(
         _SymmetricMemory: the symmetric memory workspace associated with the
         group.
     """
+    device = torch.device(torch.accelerator.current_device_index())
+    rocshmem = torch.version.hip is not None and get_backend(device) == "NVSHMEM"
+    if rocshmem and c10d._resolve_process_group(group_name) is not c10d.group.WORLD:
+        raise RuntimeError("rocSHMEM workspace allocation requires the world group")
     tensor = _group_name_to_workspace_tensor.get(group_name)
     size = tensor.numel() * tensor.element_size() if tensor is not None else 0
     if tensor is None or size < min_size:
@@ -143,10 +147,14 @@ def get_symm_mem_workspace(
             (max(size, min_size),),
             [1],
             torch.uint8,
-            torch.device(torch.accelerator.current_device_index()),
-            group_name,
+            device,
+            None if rocshmem else group_name,
         )
         _group_name_to_workspace_tensor[group_name] = tensor
+    # rocSHMEM heap allocation is collective over world. The logical group
+    # belongs to the rendezvous, not the allocator.
+    if rocshmem:
+        return _SymmetricMemory.rendezvous(tensor, group_name)
     return _SymmetricMemory.rendezvous(tensor)
 
 

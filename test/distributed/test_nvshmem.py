@@ -5,6 +5,7 @@
 
 
 import os
+import unittest
 
 import torch
 import torch.distributed as dist
@@ -103,6 +104,24 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         out = symm_mem.empty(numel, dtype=dtype, device=self.device)
         self.assertEqual(out.device, self.device)
         symm_mem.rendezvous(out, group=group_name)
+
+    @unittest.skipUnless(TEST_WITH_ROCM, "requires rocSHMEM")
+    def test_world_workspace_reuse(self) -> None:
+        self._init_device()
+        group = dist.group.WORLD.group_name
+        hdl = symm_mem.get_symm_mem_workspace(group, 256)
+        buf = hdl.get_buffer(self.rank, (64,), torch.int32)
+        buf.fill_(self.rank)
+        reused = symm_mem.get_symm_mem_workspace(group, 128)
+        self.assertEqual(
+            reused.get_buffer(self.rank, (64,), torch.int32).data_ptr(), buf.data_ptr()
+        )
+        hdl.barrier()
+        peer = (self.rank + 1) % self.world_size
+        self.assertEqual(
+            reused.get_buffer(peer, (64,), torch.int32), torch.full_like(buf, peer)
+        )
+        hdl.barrier()
 
     def test_mempool_tensor_factory(self) -> None:
         """
