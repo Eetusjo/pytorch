@@ -542,6 +542,10 @@ TORCH_LIBRARY_FRAGMENT(symm_mem, m) {
 
   m.def("nvshmem_put(Tensor(a!) tensor, int peer) -> ()");
   m.def("nvshmem_get(Tensor(a!) tensor, int peer) -> ()");
+  // Internal AsyncTP producer. dst is [rank, rows, features]. ready[c] (a
+  // fresh, zeroed local int64 word) publishes slice c of every rank's rows.
+  m.def(
+      "_rocshmem_gather_slices(Tensor src, Tensor(a!) dst, Tensor(b!) ready, str group_name) -> ()");
   m.def(
       "nvshmem_get_out(Tensor(a!) dst, __torch__.torch.classes.c10d.SymmetricMemory hdl, int offset, int size, int peer) -> ()");
   m.def(

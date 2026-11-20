@@ -204,6 +204,54 @@ at::Tensor nvshmem_all_to_all(
   return out;
 }
 
+namespace {
+// A signal describes a vertical slice of every sender's interval, not a
+// contiguous chunk of the final result. Keep the externally visible rank order.
+__global__ void gather_slices(
+    const char* src, char* dst, uint64_t* ready, size_t bytes, int pieces) {
+  const auto team = ROCSHMEM_TEAM_WORLD;
+  const int rank = rocshmem_my_pe();
+  const int peers = rocshmem_n_pes();
+  rocshmem_ctx_sync_wg(ROCSHMEM_CTX_DEFAULT, team);
+  for (int c = 0; c < pieces; ++c) {
+    for (int pe = threadIdx.x; pe < peers; pe += blockDim.x) {
+      rocshmem_putmem_nbi(
+          dst + (size_t(rank) * pieces + c) * bytes, src + c * bytes, bytes, pe);
+      rocshmem_pe_quiet(&pe, 1);
+    }
+    __syncthreads();
+    rocshmem_ctx_sync_wg(ROCSHMEM_CTX_DEFAULT, team);
+    if (threadIdx.x == 0) {
+      __hip_atomic_store(ready + c, uint64_t(1), __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+  }
+}
+
+void rocshmem_gather_slices(
+    const at::Tensor& src, at::Tensor& dst, at::Tensor& ready,
+    const std::string& group_name) {
+  TORCH_CHECK(src.is_cuda() && src.device() == dst.device() && src.device() == ready.device());
+  c10::cuda::CUDAGuard guard(src.device());
+  TORCH_CHECK(c10d::resolve_process_group(group_name) == c10d::resolve_process_group("0"),
+              "rocSHMEM gather slices requires the default world group");
+  TORCH_CHECK(c10d::symmetric_memory::get_backend(src.device()) == "NVSHMEM");
+  TORCH_CHECK(src.is_contiguous() && dst.is_contiguous() && ready.is_contiguous());
+  TORCH_CHECK(!dst.is_alias_of(src) && !ready.is_alias_of(src) && !ready.is_alias_of(dst));
+  TORCH_CHECK(src.dim() == 2 && dst.dim() == 3 && dst.size(1) == src.size(0) &&
+              dst.size(2) == src.size(1) && dst.scalar_type() == src.scalar_type());
+  TORCH_CHECK(ready.dim() == 1 && ready.scalar_type() == at::kLong &&
+              ready.numel() > 0 && ready.numel() <= INT_MAX &&
+              src.numel() > 0 && src.size(0) % ready.numel() == 0);
+  auto hdl = c10d::symmetric_memory::rendezvous(dst, group_name);
+  TORCH_CHECK(hdl && hdl->world_within_direct_access() && dst.size(0) == hdl->get_world_size());
+  hipLaunchKernelGGL(gather_slices, dim3(1), dim3(64), 0, at::cuda::getCurrentCUDAStream(),
+                     static_cast<const char*>(src.const_data_ptr()), static_cast<char*>(dst.mutable_data_ptr()),
+                     reinterpret_cast<uint64_t*>(ready.mutable_data_ptr()), src.nbytes() / ready.numel(),
+                     static_cast<int>(ready.numel()));
+  C10_HIP_CHECK(hipGetLastError());
+}
+} // namespace
+
 // This is an exclusive prefix sum function that calculates read (or write) offsets for each peer.
 __device__ int64_t prefixSum(int64_t *odata, int64_t *idata, int n) {
   // Specialize BlockScan for a 1D block of threads, of type int64_t.
@@ -908,6 +956,7 @@ void release_nvshmem_team_pool(const std::string& group_name) {
 } // namespace c10d::nvshmem_extension
 
 TORCH_LIBRARY_IMPL(symm_mem, CUDA, m) {
+  m.impl("_rocshmem_gather_slices", c10d::nvshmem_extension::rocshmem_gather_slices);
   m.impl("nvshmem_broadcast", c10d::nvshmem_extension::nvshmem_broadcast);
   m.impl("nvshmem_put", c10d::nvshmem_extension::nvshmem_put);
   m.impl("nvshmem_get", c10d::nvshmem_extension::nvshmem_get);

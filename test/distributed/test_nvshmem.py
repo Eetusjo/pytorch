@@ -123,6 +123,31 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
         )
         hdl.barrier()
 
+    @unittest.skipUnless(TEST_WITH_ROCM, "requires rocSHMEM")
+    def test_progressive_gather_rank_order(self) -> None:
+        self._init_device()
+        group = dist.group.WORLD.group_name
+        out = symm_mem.empty(
+            (self.world_size, 16, 64), device=self.device, dtype=torch.int32
+        )
+        symm_mem.rendezvous(out, group)
+        comm = torch.cuda.Stream(device=self.device)
+        compute = torch.cuda.current_stream()
+        for epoch in range(3):
+            tile = torch.arange(16 * 64, device=self.device, dtype=torch.int32).reshape(16, 64)
+            tile += 4096 * epoch
+            src = tile + self.rank
+            ready = torch.zeros(4, device=self.device, dtype=torch.int64)
+            pieces = []
+            comm.wait_stream(compute)
+            with torch.cuda.stream(comm):
+                torch.ops.symm_mem._rocshmem_gather_slices(src, out, ready, group)
+            for c, view in enumerate(out.chunk(4, dim=1)):
+                torch.ops.symm_mem.nvshmem_wait_for_signal(ready[c : c + 1], 1, self.rank)
+                pieces.append(view.clone())
+            compute.wait_stream(comm)
+            self.assertEqual(torch.cat(pieces, dim=1), torch.stack([tile + r for r in range(self.world_size)]))
+
     def test_mempool_tensor_factory(self) -> None:
         """
         Test the effectiveness of MemPool on tensor factory ops.
