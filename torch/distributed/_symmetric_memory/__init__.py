@@ -980,6 +980,15 @@ def _fused_all_gather_matmul(
             A_shard, Bs, gather_dim, group_name, return_A=return_A
         )
 
+    if _should_use_fused_all_gather_matmul_native(A_shard, Bs, gather_dim, group_name):
+        group = c10d._resolve_process_group(group_name)
+        leading_dims = list(A_shard.shape[:-1])
+        leading_dims[0] *= group.size()
+        A, out = _fused_all_gather_matmul_native(
+            A_shard.flatten(0, -2), Bs[0], group_name
+        )
+        return A.view(*leading_dims, -1), [out.view(*leading_dims, -1)]
+
     if torch.version.hip is not None:
         from . import _rocshmem_async
 
@@ -992,15 +1001,6 @@ def _fused_all_gather_matmul(
             return _fused_all_gather_matmul_fallback(
                 A_shard, Bs, gather_dim, group_name, return_A=return_A
             )
-
-    if _should_use_fused_all_gather_matmul_native(A_shard, Bs, gather_dim, group_name):
-        group = c10d._resolve_process_group(group_name)
-        leading_dims = list(A_shard.shape[:-1])
-        leading_dims[0] *= group.size()
-        A, out = _fused_all_gather_matmul_native(
-            A_shard.flatten(0, -2), Bs[0], group_name
-        )
-        return A.view(*leading_dims, -1), [out.view(*leading_dims, -1)]
 
     if _should_use_multimem_all_gather_matmul(
         A_shard, gather_dim, group_name, return_A

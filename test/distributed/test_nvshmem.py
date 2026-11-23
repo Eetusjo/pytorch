@@ -166,6 +166,38 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
             self.assertEqual([y.stride() for y in ys], [z.stride() for z in zs])
 
     @unittest.skipUnless(TEST_WITH_ROCM, "requires rocSHMEM")
+    def test_rocshmem_opt_in_preserves_native_small_m(self) -> None:
+        self._init_device()
+        if torch.cuda.get_device_properties(self.device).gcnArchName.split(":")[
+            0
+        ] not in ("gfx942", "gfx950"):
+            self.skipTest("requires the ROCm native async matmul kernel")
+        group = dist.group.WORLD.group_name
+        rows = 4096 // self.world_size
+        src = symm_mem.empty((rows, 256), device=self.device, dtype=torch.bfloat16)
+        symm_mem.rendezvous(src, group)
+        src.fill_(self.rank + 1)
+        b = torch.eye(256, dtype=src.dtype, device=self.device)
+        with (
+            patch.dict(
+                os.environ,
+                TORCH_SYMM_MEM_ENABLE_NATIVE_ASYNC_TP="1",
+                TORCH_SYMM_MEM_ROCSHMEM_ASYNC_TP="1",
+            ),
+            patch.object(
+                symm_mem,
+                "_fused_all_gather_matmul_native",
+                wraps=symm_mem._fused_all_gather_matmul_native,
+            ) as native,
+        ):
+            a, (out,) = torch.ops.symm_mem.fused_all_gather_matmul(src, [b], 0, group)
+        native.assert_called_once()
+        ref = torch.arange(1, self.world_size + 1, device=self.device, dtype=src.dtype)
+        ref = ref.repeat_interleave(rows)[:, None].expand_as(out)
+        self.assertEqual(a, ref)
+        self.assertEqual(out, ref)
+
+    @unittest.skipUnless(TEST_WITH_ROCM, "requires rocSHMEM")
     def test_fused_reduce_scatter_natural_rows(self) -> None:
         self._init_device()
         group = dist.group.WORLD.group_name

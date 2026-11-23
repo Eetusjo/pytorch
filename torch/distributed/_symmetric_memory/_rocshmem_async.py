@@ -38,7 +38,13 @@ def pieces_for(
         if x.size(dim) % group.size():
             return 0
         rows //= group.size()
-    return 4 if rows * group.size() > 4096 and rows % 4 == 0 else 0
+    if rows * group.size() <= 4096 or rows % 4:
+        return 0
+    # Large local shards can expose their first GEMM sooner without making the
+    # individual SDMA puts small. RS benefits from larger producer GEMMs.
+    if not scatter and group.size() == 8 and rows % 8 == 0 and x.nbytes >= (64 << 20):
+        return 8
+    return 4
 
 
 def gather_mm(
