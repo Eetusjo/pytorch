@@ -503,6 +503,7 @@ def triton_reduce_partials_first_dim(
     reduce_op: str,
     output_dtype: torch.dtype,
     group_size: int,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     if (
         partials.device.type != "cuda"
@@ -515,7 +516,15 @@ def triton_reduce_partials_first_dim(
     ):
         return None
 
-    out = partials.new_empty(partials.shape[1:], dtype=output_dtype)
+    if out is None:
+        out = partials.new_empty(partials.shape[1:], dtype=output_dtype)
+    elif (
+        out.shape != partials.shape[1:]
+        or out.device != partials.device
+        or out.dtype != output_dtype
+        or not out.is_contiguous()
+    ):
+        raise ValueError("expected a contiguous output shard matching the partials")
     shard_elems = out.numel()
     block = 1024
     import triton
@@ -1440,7 +1449,9 @@ def _fused_matmul_reduce_scatter(
         if _rocshmem_async.requested(A):
             if reduce_op not in ("sum", "avg"):
                 raise ValueError("reduce_op must be sum or avg")
-            pieces = _rocshmem_async.pieces_for(A, scatter_dim, group_name, scatter=True)
+            pieces = _rocshmem_async.pieces_for(
+                A, scatter_dim, group_name, scatter_cols=B.size(1)
+            )
             if pieces:
                 return _rocshmem_async.mm_scatter(
                     A, B, scatter_dim, reduce_op, group_name, pieces

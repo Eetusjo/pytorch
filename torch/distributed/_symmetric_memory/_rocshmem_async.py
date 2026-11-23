@@ -19,7 +19,7 @@ def requested(x: torch.Tensor) -> bool:
 
 
 def pieces_for(
-    x: torch.Tensor, dim: int, group_name: c10d.GroupName, *, scatter: bool = False
+    x: torch.Tensor, dim: int, group_name: c10d.GroupName, *, scatter_cols: int | None = None
 ) -> int:
     group = c10d._resolve_process_group(group_name)
     if (
@@ -34,7 +34,7 @@ def pieces_for(
     # Keep tail handling and the existing small-M native path out of this
     # experimental selector. Only collective-uniform shape metadata is used.
     rows = math.prod(x.shape[:-1])
-    if scatter:
+    if scatter_cols is not None:
         if x.size(dim) % group.size():
             return 0
         rows //= group.size()
@@ -42,8 +42,18 @@ def pieces_for(
         return 0
     # Large local shards can expose their first GEMM sooner without making the
     # individual SDMA puts small. RS benefits from larger producer GEMMs.
-    if not scatter and group.size() == 8 and rows % 8 == 0 and x.nbytes >= (64 << 20):
-        return 8
+    if group.size() == 8:
+        if scatter_cols is None:
+            if rows % 8 == 0 and x.nbytes >= (64 << 20):
+                return 8
+        else:
+            # Size RS tiles by the collective-uniform output, not the local
+            # contracting dimension. Keep about 16 MiB per peer per transfer.
+            size = rows * scatter_cols * x.element_size()
+            target = min(8, (size + (8 << 20)) // (16 << 20))
+            for count in range(target, 4, -1):
+                if rows % count == 0:
+                    return count
     return 4
 
 
@@ -110,7 +120,12 @@ def mm_scatter(
             group_name, 2 * pieces * elements * x.element_size()
         )
         result = a.new_empty(rows, n)
-        reduce_out = torch.sum if reduction == "sum" else torch.mean
+        def reduce_into(partial: torch.Tensor, dest: torch.Tensor) -> None:
+            if sm.triton_reduce_partials_first_dim(
+                partial, reduce_op=reduction, output_dtype=a.dtype, group_size=p, out=dest
+            ) is None:
+                op = torch.sum if reduction == "sum" else torch.mean
+                op(partial, dim=0, out=dest)
         # The inputs and outputs of different pieces are disjoint. Rendezvous
         # once before overwriting this invocation's workspace, not per piece.
         compute.wait_stream(comm)
@@ -127,11 +142,11 @@ def mm_scatter(
             if pending is not None:
                 previous, ready = pending
                 compute.wait_event(ready)
-                reduce_out(previous, dim=0, out=result[(i - 1) * m : i * m])
+                reduce_into(previous, result[(i - 1) * m : i * m])
             pending = recv, done
         assert pending is not None
         previous, ready = pending
         compute.wait_event(ready)
-        reduce_out(previous, dim=0, out=result[-m:])
+        reduce_into(previous, result[-m:])
         comm.wait_stream(compute)
         return result.view(x.size(0) // p, *x.shape[1:-1], n).movedim(0, dim).contiguous()
