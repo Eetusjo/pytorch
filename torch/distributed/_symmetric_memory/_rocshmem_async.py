@@ -110,34 +110,28 @@ def mm_scatter(
             group_name, 2 * pieces * elements * x.element_size()
         )
         result = a.new_empty(rows, n)
-        received = []
-        done = []
+        reduce_out = torch.sum if reduction == "sum" else torch.mean
+        # The inputs and outputs of different pieces are disjoint. Rendezvous
+        # once before overwriting this invocation's workspace, not per piece.
+        compute.wait_stream(comm)
+        hdl.barrier()
+        pending = None
         for i in range(pieces):
             send = hdl.get_buffer(hdl.rank, (p, m, n), a.dtype, 2 * i * elements)
             recv = hdl.get_buffer(hdl.rank, (p, m, n), a.dtype, (2 * i + 1) * elements)
             torch.bmm(tiles[:, i * m : (i + 1) * m], b.expand(p, -1, -1), out=send)
             comm.wait_stream(compute)
             with torch.cuda.stream(comm):
-                # All ranks have retired prior inbox consumers before writing.
-                hdl.barrier()
                 torch.ops.symm_mem.nvshmem_all_to_all(send, recv, group_name)
-                hdl.barrier()
-                done.append(comm.record_event())
-            received.append(recv)
-            if i:
-                compute.wait_event(done[i - 1])
-                result[(i - 1) * m : i * m].copy_(
-                    sm.reduce_partials(
-                        received[i - 1], dim=0, reduce_op=reduction,
-                        output_dtype=a.dtype, group_size=p,
-                    )
-                )
-        compute.wait_event(done[-1])
-        result[-m:].copy_(
-            sm.reduce_partials(
-                received[-1], dim=0, reduce_op=reduction,
-                output_dtype=a.dtype, group_size=p,
-            )
-        )
+                done = comm.record_event()
+            if pending is not None:
+                previous, ready = pending
+                compute.wait_event(ready)
+                reduce_out(previous, dim=0, out=result[(i - 1) * m : i * m])
+            pending = recv, done
+        assert pending is not None
+        previous, ready = pending
+        compute.wait_event(ready)
+        reduce_out(previous, dim=0, out=result[-m:])
         comm.wait_stream(compute)
         return result.view(x.size(0) // p, *x.shape[1:-1], n).movedim(0, dim).contiguous()

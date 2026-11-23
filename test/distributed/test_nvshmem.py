@@ -212,6 +212,34 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
             self.assertEqual(actual, ref)
             self.assertEqual(actual.stride(), ref.stride())
 
+    @unittest.skipUnless(TEST_WITH_ROCM, "requires rocSHMEM")
+    def test_fused_scatter_reuse_across_streams(self) -> None:
+        self._init_device()
+        p, rows = self.world_size, 4096
+        group = dist.group.WORLD.group_name
+        streams = [torch.cuda.Stream(device=self.device) for _ in range(2)]
+        b = torch.eye(16, device=self.device)
+        base = torch.arange(p * rows, device=self.device)[:, None] % 17
+        main = torch.cuda.current_stream(self.device)
+        results = []
+        for stream in streams:
+            stream.wait_stream(main)
+        with patch.dict(os.environ, TORCH_SYMM_MEM_ROCSHMEM_ASYNC_TP="1"):
+            for epoch in range(4):
+                with torch.cuda.stream(streams[epoch % 2]):
+                    a = (base + epoch + self.rank).float().expand(-1, 16).contiguous()
+                    results.append(
+                        torch.ops.symm_mem.fused_matmul_reduce_scatter(
+                            a, b, "sum", 0, group
+                        )
+                    )
+        for stream in streams:
+            main.wait_stream(stream)
+        for epoch, result in enumerate(results):
+            local = base[self.rank * rows : (self.rank + 1) * rows]
+            ref = ((local + epoch) * p + p * (p - 1) // 2).float().expand_as(result)
+            self.assertEqual(result, ref)
+
     def test_mempool_tensor_factory(self) -> None:
         """
         Test the effectiveness of MemPool on tensor factory ops.
