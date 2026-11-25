@@ -56,21 +56,27 @@ __global__ void pull_nd(
     const char* src, char* dst, const int* global_pes, uint32_t** pads, int rank, int peers,
     int64_t rows, size_t width, size_t peer_stride, size_t row_stride,
     bool scatter_rows) {
-  if (pads != nullptr) {
-    c10d::symmetric_memory::sync_remote_blocks<true, true>(pads, rank, peers);
-    __syncthreads();
+  // Keep the peer handshakes in one resident workgroup. Each active wave
+  // can post reads as soon as its peer publishes input, independently of skew.
+  const bool pairwise = pads != nullptr;
+  if (pairwise && threadIdx.x % 64 != 0) {
+    return;
   }
-  for (int j = threadIdx.x; j < peers; j += blockDim.x) {
+  for (int j = pairwise ? threadIdx.x / 64 : threadIdx.x; j < peers; j += blockDim.x) {
     const int pe = global_pes[j];
+    if (pairwise && j != rank) {
+      c10d::symmetric_memory::put_signal<std::memory_order_release>(pads[j] + rank);
+      c10d::symmetric_memory::wait_signal<std::memory_order_acquire>(pads[rank] + j);
+    }
     for (int64_t r = 0; r < rows; ++r) {
       const auto slot = scatter_rows ? r * peers + j : j * rows + r;
       rocshmem_getmem_nbi(dst + slot * width, src + rank * peer_stride + r * row_stride, width, pe);
     }
     rocshmem_pe_quiet(&pe, 1);
-  }
-  if (pads != nullptr) {
-    __syncthreads();
-    c10d::symmetric_memory::sync_remote_blocks<true, false>(pads, rank, peers);
+    if (pairwise && j != rank) {
+      c10d::symmetric_memory::put_signal<std::memory_order_release>(pads[j] + rank);
+      c10d::symmetric_memory::wait_signal<std::memory_order_acquire>(pads[rank] + j);
+    }
   }
 }
 
@@ -106,9 +112,8 @@ void rocshmem_all_to_all_nd(
   }
   const auto es = src.element_size();
   c10d::symmetric_memory::GroupStreamGuard order(group_name);
-  // One workgroup can publish inputs and retire reads on the same signal pad.
-  constexpr int threads = 64;
-  auto pads = p <= threads ? reinterpret_cast<uint32_t**>(hdl->get_signal_pad_ptrs_dev()) : nullptr;
+  auto pads = p <= 8 ? reinterpret_cast<uint32_t**>(hdl->get_signal_pad_ptrs_dev()) : nullptr;
+  const int threads = pads ? p * 64 : 64;
   if (!pads) {
     hdl->barrier(0, 0);
   }
