@@ -147,6 +147,40 @@ class NVSHMEMSymmetricMemoryTest(MultiProcContinuousTest):
             self.assertEqual(out, expected)
 
     @unittest.skipUnless(TEST_WITH_ROCM, "requires rocSHMEM")
+    @skip_if_lt_x_gpu(4)
+    def test_nd_disjoint_teams_retire_reads_before_input_reuse(self) -> None:
+        self._init_device()
+        if self.world_size % 2:
+            self.skipTest("requires equal teams")
+        for parity in range(2):
+            members = list(range(parity, self.world_size, 2))
+            team = dist.new_group(members)
+            if self.rank in members:
+                group, ranks = team, members
+        p = len(ranks)
+        try:
+            src = symm_mem.empty(p, 3, 4096, device=self.device, dtype=torch.int32)
+            symm_mem.rendezvous(src, group)
+            tile = torch.arange(3 * 4096, device=self.device, dtype=src.dtype).view(3, -1)
+            outputs = []
+            for epoch in range(4):
+                if group.rank() == epoch % p:
+                    torch.cuda._sleep(250_000)
+                for j in range(p):
+                    src[j].copy_(tile + self.rank * 100_000 + j + epoch * 1_000_000)
+                out = torch.empty(3, p, 4096, device=self.device, dtype=src.dtype)
+                symm_mem.all_to_all_nd(src, out, 0, 1, group=group.group_name)
+                src.fill_(-1)
+                outputs.append(out)
+            for epoch, out in enumerate(outputs):
+                expected = torch.stack(
+                    [tile + sender * 100_000 + group.rank() + epoch * 1_000_000 for sender in ranks], dim=1
+                )
+                self.assertEqual(out, expected)
+        finally:
+            dist.destroy_process_group(group)
+
+    @unittest.skipUnless(TEST_WITH_ROCM, "requires rocSHMEM")
     def test_progressive_gather_rank_order(self) -> None:
         self._init_device()
         group = dist.group.WORLD.group_name
